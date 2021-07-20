@@ -44,12 +44,13 @@ def build_classification_model(
     l2_regularizer: tf.keras.regularizers.Regularizer = None,
     skip_logits_layer: bool = False) -> tf.keras.Model:
   """Builds the classification model."""
+  norm_activation_config = model_config.norm_activation
   backbone = backbones.factory.build_backbone(
       input_specs=input_specs,
-      model_config=model_config,
+      backbone_config=model_config.backbone,
+      norm_activation_config=norm_activation_config,
       l2_regularizer=l2_regularizer)
 
-  norm_activation_config = model_config.norm_activation
   model = classification_model.ClassificationModel(
       backbone=backbone,
       num_classes=model_config.num_classes,
@@ -69,10 +70,13 @@ def build_maskrcnn(
     model_config: maskrcnn_cfg.MaskRCNN,
     l2_regularizer: tf.keras.regularizers.Regularizer = None) -> tf.keras.Model:
   """Builds Mask R-CNN model."""
+  norm_activation_config = model_config.norm_activation
   backbone = backbones.factory.build_backbone(
       input_specs=input_specs,
-      model_config=model_config,
+      backbone_config=model_config.backbone,
+      norm_activation_config=norm_activation_config,
       l2_regularizer=l2_regularizer)
+  backbone(tf.keras.Input(input_specs.shape[1:]))
 
   decoder = decoder_factory.build_decoder(
       input_specs=backbone.output_specs,
@@ -85,7 +89,6 @@ def build_maskrcnn(
   roi_aligner_config = model_config.roi_aligner
   detection_head_config = model_config.detection_head
   generator_config = model_config.detection_generator
-  norm_activation_config = model_config.norm_activation
   num_anchors_per_location = (
       len(model_config.anchor.aspect_ratios) * model_config.anchor.num_scales)
 
@@ -114,7 +117,28 @@ def build_maskrcnn(
       use_sync_bn=norm_activation_config.use_sync_bn,
       norm_momentum=norm_activation_config.norm_momentum,
       norm_epsilon=norm_activation_config.norm_epsilon,
-      kernel_regularizer=l2_regularizer)
+      kernel_regularizer=l2_regularizer,
+      name='detection_head')
+  if roi_sampler_config.cascade_iou_thresholds:
+    detection_head_cascade = [detection_head]
+    for cascade_num in range(len(roi_sampler_config.cascade_iou_thresholds)):
+      detection_head = instance_heads.DetectionHead(
+          num_classes=model_config.num_classes,
+          num_convs=detection_head_config.num_convs,
+          num_filters=detection_head_config.num_filters,
+          use_separable_conv=detection_head_config.use_separable_conv,
+          num_fcs=detection_head_config.num_fcs,
+          fc_dims=detection_head_config.fc_dims,
+          class_agnostic_bbox_pred=detection_head_config
+          .class_agnostic_bbox_pred,
+          activation=norm_activation_config.activation,
+          use_sync_bn=norm_activation_config.use_sync_bn,
+          norm_momentum=norm_activation_config.norm_momentum,
+          norm_epsilon=norm_activation_config.norm_epsilon,
+          kernel_regularizer=l2_regularizer,
+          name='detection_head_{}'.format(cascade_num + 1))
+      detection_head_cascade.append(detection_head)
+    detection_head = detection_head_cascade
 
   roi_generator_obj = roi_generator.MultilevelROIGenerator(
       pre_nms_top_k=roi_generator_config.pre_nms_top_k,
@@ -160,7 +184,7 @@ def build_maskrcnn(
       sample_offset=roi_aligner_config.sample_offset)
 
   detection_generator_obj = detection_generator.DetectionGenerator(
-      apply_nms=True,
+      apply_nms=generator_config.apply_nms,
       pre_nms_top_k=generator_config.pre_nms_top_k,
       pre_nms_score_threshold=generator_config.pre_nms_score_threshold,
       nms_iou_threshold=generator_config.nms_iou_threshold,
@@ -221,10 +245,13 @@ def build_retinanet(
     model_config: retinanet_cfg.RetinaNet,
     l2_regularizer: tf.keras.regularizers.Regularizer = None) -> tf.keras.Model:
   """Builds RetinaNet model."""
+  norm_activation_config = model_config.norm_activation
   backbone = backbones.factory.build_backbone(
       input_specs=input_specs,
-      model_config=model_config,
+      backbone_config=model_config.backbone,
+      norm_activation_config=norm_activation_config,
       l2_regularizer=l2_regularizer)
+  backbone(tf.keras.Input(input_specs.shape[1:]))
 
   decoder = decoder_factory.build_decoder(
       input_specs=backbone.output_specs,
@@ -233,7 +260,6 @@ def build_retinanet(
 
   head_config = model_config.head
   generator_config = model_config.detection_generator
-  norm_activation_config = model_config.norm_activation
   num_anchors_per_location = (
       len(model_config.anchor.aspect_ratios) * model_config.anchor.num_scales)
 
@@ -255,7 +281,7 @@ def build_retinanet(
       kernel_regularizer=l2_regularizer)
 
   detection_generator_obj = detection_generator.MultilevelDetectionGenerator(
-      apply_nms=True,
+      apply_nms=generator_config.apply_nms,
       pre_nms_top_k=generator_config.pre_nms_top_k,
       pre_nms_score_threshold=generator_config.pre_nms_score_threshold,
       nms_iou_threshold=generator_config.nms_iou_threshold,
@@ -280,9 +306,11 @@ def build_segmentation_model(
     model_config: segmentation_cfg.SemanticSegmentationModel,
     l2_regularizer: tf.keras.regularizers.Regularizer = None) -> tf.keras.Model:
   """Builds Segmentation model."""
+  norm_activation_config = model_config.norm_activation
   backbone = backbones.factory.build_backbone(
       input_specs=input_specs,
-      model_config=model_config,
+      backbone_config=model_config.backbone,
+      norm_activation_config=norm_activation_config,
       l2_regularizer=l2_regularizer)
 
   decoder = decoder_factory.build_decoder(
@@ -291,7 +319,6 @@ def build_segmentation_model(
       l2_regularizer=l2_regularizer)
 
   head_config = model_config.head
-  norm_activation_config = model_config.norm_activation
 
   head = segmentation_heads.SegmentationHead(
       num_classes=model_config.num_classes,

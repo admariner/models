@@ -16,7 +16,6 @@
 
 from typing import Any, List, Mapping, Optional, Union
 
-# Import libraries
 import tensorflow as tf
 
 from official.vision.beta.ops import anchor
@@ -31,7 +30,8 @@ class MaskRCNNModel(tf.keras.Model):
                backbone: tf.keras.Model,
                decoder: tf.keras.Model,
                rpn_head: tf.keras.layers.Layer,
-               detection_head: tf.keras.layers.Layer,
+               detection_head: Union[tf.keras.layers.Layer,
+                                     List[tf.keras.layers.Layer]],
                roi_generator: tf.keras.layers.Layer,
                roi_sampler: Union[tf.keras.layers.Layer,
                                   List[tf.keras.layers.Layer]],
@@ -54,7 +54,7 @@ class MaskRCNNModel(tf.keras.Model):
       backbone: `tf.keras.Model`, the backbone network.
       decoder: `tf.keras.Model`, the decoder network.
       rpn_head: the RPN head.
-      detection_head: the detection head.
+      detection_head: the detection head or a list of heads.
       roi_generator: the ROI generator.
       roi_sampler: a single ROI sampler or a list of ROI samplers for cascade
         detection heads.
@@ -104,7 +104,10 @@ class MaskRCNNModel(tf.keras.Model):
     self.backbone = backbone
     self.decoder = decoder
     self.rpn_head = rpn_head
-    self.detection_head = detection_head
+    if not isinstance(detection_head, (list, tuple)):
+      self.detection_head = [detection_head]
+    else:
+      self.detection_head = detection_head
     self.roi_generator = roi_generator
     if not isinstance(roi_sampler, (list, tuple)):
       self.roi_sampler = [roi_sampler]
@@ -136,21 +139,25 @@ class MaskRCNNModel(tf.keras.Model):
            images: tf.Tensor,
            image_shape: tf.Tensor,
            anchor_boxes: Optional[Mapping[str, tf.Tensor]] = None,
-           gt_boxes: tf.Tensor = None,
-           gt_classes: tf.Tensor = None,
-           gt_masks: tf.Tensor = None,
-           training: bool = None) -> Mapping[str, tf.Tensor]:
+           gt_boxes: Optional[tf.Tensor] = None,
+           gt_classes: Optional[tf.Tensor] = None,
+           gt_masks: Optional[tf.Tensor] = None,
+           training: Optional[bool] = None) -> Mapping[str, tf.Tensor]:
     model_outputs = {}
 
     # Feature extraction.
-    features = self.backbone(images)
+    backbone_features = self.backbone(images)
     if self.decoder:
-      features = self.decoder(features)
+      features = self.decoder(backbone_features)
+    else:
+      features = backbone_features
 
     # Region proposal network.
     rpn_scores, rpn_boxes = self.rpn_head(features)
 
     model_outputs.update({
+        'backbone_features': backbone_features,
+        'decoder_features': features,
         'rpn_boxes': rpn_boxes,
         'rpn_scores': rpn_scores
     })
@@ -191,7 +198,7 @@ class MaskRCNNModel(tf.keras.Model):
            gt_classes=gt_classes,
            training=training,
            model_outputs=model_outputs,
-           layer_num=cascade_num,
+           cascade_num=cascade_num,
            regression_weights=regression_weights)
       all_class_outputs.append(class_outputs)
 
@@ -216,11 +223,21 @@ class MaskRCNNModel(tf.keras.Model):
           regression_weights,
           bbox_per_class=(not self._config_dict['class_agnostic_bbox_pred']))
       model_outputs.update({
-          'detection_boxes': detections['detection_boxes'],
-          'detection_scores': detections['detection_scores'],
-          'detection_classes': detections['detection_classes'],
-          'num_detections': detections['num_detections'],
+          'cls_outputs': class_outputs,
+          'box_outputs': box_outputs,
       })
+      if self.detection_generator.get_config()['apply_nms']:
+        model_outputs.update({
+            'detection_boxes': detections['detection_boxes'],
+            'detection_scores': detections['detection_scores'],
+            'detection_classes': detections['detection_classes'],
+            'num_detections': detections['num_detections']
+        })
+      else:
+        model_outputs.update({
+            'decoded_boxes': detections['decoded_boxes'],
+            'decoded_box_scores': detections['decoded_box_scores']
+        })
 
     if not self._include_mask:
       return model_outputs
@@ -256,7 +273,7 @@ class MaskRCNNModel(tf.keras.Model):
     return model_outputs
 
   def _run_frcnn_head(self, features, rois, gt_boxes, gt_classes, training,
-                      model_outputs, layer_num, regression_weights):
+                      model_outputs, cascade_num, regression_weights):
     """Runs the frcnn head that does both class and box prediction.
 
     Args:
@@ -269,7 +286,7 @@ class MaskRCNNModel(tf.keras.Model):
         classes. It is padded with -1s to indicate the invalid classes.
       training: `bool`, if model is training or being evaluated.
       model_outputs: `dict`, used for storing outputs used for eval and losses.
-      layer_num: `int`, the current frcnn layer in the cascade.
+      cascade_num: `int`, the current frcnn layer in the cascade.
       regression_weights: `list`, weights used for l1 loss in bounding box
         regression.
 
@@ -295,7 +312,7 @@ class MaskRCNNModel(tf.keras.Model):
     if training and gt_boxes is not None:
       rois = tf.stop_gradient(rois)
 
-      current_roi_sampler = self.roi_sampler[layer_num]
+      current_roi_sampler = self.roi_sampler[cascade_num]
       rois, matched_gt_boxes, matched_gt_classes, matched_gt_indices = (
           current_roi_sampler(rois, gt_boxes, gt_classes))
       # Create bounding box training targets.
@@ -307,10 +324,11 @@ class MaskRCNNModel(tf.keras.Model):
               tf.expand_dims(tf.equal(matched_gt_classes, 0), axis=-1),
               [1, 1, 4]), tf.zeros_like(box_targets), box_targets)
       model_outputs.update({
-          'class_targets_{}'.format(layer_num)
-          if layer_num else 'class_targets':
+          'class_targets_{}'.format(cascade_num)
+          if cascade_num else 'class_targets':
               matched_gt_classes,
-          'box_targets_{}'.format(layer_num) if layer_num else 'box_targets':
+          'box_targets_{}'.format(cascade_num)
+          if cascade_num else 'box_targets':
               box_targets,
       })
 
@@ -318,12 +336,14 @@ class MaskRCNNModel(tf.keras.Model):
     roi_features = self.roi_aligner(features, rois)
 
     # Run frcnn head to get class and bbox predictions.
-    class_outputs, box_outputs = self.detection_head(roi_features)
+    current_detection_head = self.detection_head[cascade_num]
+    class_outputs, box_outputs = current_detection_head(roi_features)
 
     model_outputs.update({
-        'class_outputs_{}'.format(layer_num) if layer_num else 'class_outputs':
+        'class_outputs_{}'.format(cascade_num)
+        if cascade_num else 'class_outputs':
             class_outputs,
-        'box_outputs_{}'.format(layer_num) if layer_num else 'box_outputs':
+        'box_outputs_{}'.format(cascade_num) if cascade_num else 'box_outputs':
             box_outputs,
     })
     return (class_outputs, box_outputs, model_outputs, matched_gt_boxes,
